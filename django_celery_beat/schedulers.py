@@ -40,7 +40,7 @@ Cannot add entry %r to database schedule: %r. Contents: %r
 """
 
 logger = get_logger(__name__)
-debug, info = logger.debug, logger.info
+debug, info, warning = logger.debug, logger.info, logger.warning
 
 
 class ModelEntry(ScheduleEntry):
@@ -192,7 +192,8 @@ class DatabaseScheduler(Scheduler):
 
     _schedule = None
     _last_timestamp = None
-    _initial_read = False
+    _initial_read = True
+    _heap_invalidated = False
 
     def __init__(self, *args, **kwargs):
         """Initialize the database scheduler."""
@@ -220,6 +221,8 @@ class DatabaseScheduler(Scheduler):
 
     def schedule_changed(self):
         try:
+            close_old_connections()
+
             # If MySQL is running with transaction isolation level
             # REPEATABLE-READ (default), then we won't see changes done by
             # other transactions until the current transaction is
@@ -233,6 +236,13 @@ class DatabaseScheduler(Scheduler):
         except DatabaseError as exc:
             logger.exception('Database gave error: %r', exc)
             return False
+        except InterfaceError:
+            warning(
+                'DatabaseScheduler: InterfaceError in schedule_changed(), '
+                'waiting to retry in next call...'
+            )
+            return False
+
         try:
             if ts and ts > (last if last else ts):
                 return True
@@ -250,20 +260,27 @@ class DatabaseScheduler(Scheduler):
     def sync(self):
         info('Writing entries...')
         _tried = set()
+        _failed = set()
         try:
             close_old_connections()
-            with transaction.atomic():
-                while self._dirty:
-                    try:
-                        name = self._dirty.pop()
-                        _tried.add(name)
-                        self.schedule[name].save()
-                    except (KeyError, ObjectDoesNotExist):
-                        pass
-        except (DatabaseError, InterfaceError) as exc:
-            # retry later
-            self._dirty |= _tried
+
+            while self._dirty:
+                name = self._dirty.pop()
+                try:
+                    self.schedule[name].save()
+                    _tried.add(name)
+                except (KeyError, ObjectDoesNotExist) as exc:
+                    _failed.add(name)
+        except DatabaseError as exc:
             logger.exception('Database error while sync: %r', exc)
+        except InterfaceError:
+            warning(
+                'DatabaseScheduler: InterfaceError in sync(), '
+                'waiting to retry in next call...'
+            )
+        finally:
+            # retry later, only for the failed ones
+            self._dirty |= _failed
 
     def update_from_dict(self, mapping):
         s = {}
@@ -291,13 +308,19 @@ class DatabaseScheduler(Scheduler):
             )
         self.update_from_dict(entries)
 
+    def schedules_equal(self, *args, **kwargs):
+        if self._heap_invalidated:
+            self._heap_invalidated = False
+            return False
+        return super(DatabaseScheduler, self).schedules_equal(*args, **kwargs)
+
     @property
     def schedule(self):
-        update = False
-        if not self._initial_read:
+        initial = update = False
+        if self._initial_read:
             debug('DatabaseScheduler: initial read')
-            update = True
-            self._initial_read = True
+            initial = update = True
+            self._initial_read = False
         elif self.schedule_changed():
             info('DatabaseScheduler: Schedule changed.')
             update = True
@@ -306,7 +329,9 @@ class DatabaseScheduler(Scheduler):
             self.sync()
             self._schedule = self.all_as_schedule()
             # the schedule changed, invalidate the heap in Scheduler.tick
-            self._heap = None
+            if not initial:
+                self._heap = []
+                self._heap_invalidated = True
             if logger.isEnabledFor(logging.DEBUG):
                 debug('Current schedule:\n%s', '\n'.join(
                     repr(entry) for entry in values(self._schedule)),
