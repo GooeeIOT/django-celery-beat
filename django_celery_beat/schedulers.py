@@ -76,12 +76,14 @@ class ModelEntry(ScheduleEntry):
             )
             self._disable(model)
 
-        self.options = {
-            'queue': model.queue,
-            'exchange': model.exchange,
-            'routing_key': model.routing_key,
-            'expires': model.expires,
-        }
+        self.options = {}
+        for option in ['queue', 'exchange', 'routing_key', 'expires',
+                       'priority']:
+            value = getattr(model, option)
+            if value is None:
+                continue
+            self.options[option] = value
+
         self.total_run_count = model.total_run_count
         self.model = model
 
@@ -169,11 +171,12 @@ class ModelEntry(ScheduleEntry):
 
     @classmethod
     def _unpack_options(cls, queue=None, exchange=None, routing_key=None,
-                        **kwargs):
+                        priority=None, **kwargs):
         return {
             'queue': queue,
             'exchange': exchange,
             'routing_key': routing_key,
+            'priority': priority
         }
 
     def __repr__(self):
@@ -201,9 +204,9 @@ class DatabaseScheduler(Scheduler):
         Scheduler.__init__(self, *args, **kwargs)
         self._finalize = Finalize(self, self.sync, exitpriority=5)
         self.max_interval = (
-            kwargs.get('max_interval') or
-            self.app.conf.beat_max_loop_interval or
-            DEFAULT_MAX_INTERVAL)
+            kwargs.get('max_interval')
+            or self.app.conf.beat_max_loop_interval
+            or DEFAULT_MAX_INTERVAL)
 
     def setup_schedule(self):
         self.install_default_entries(self.schedule)

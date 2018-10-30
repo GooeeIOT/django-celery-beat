@@ -3,19 +3,19 @@ from __future__ import absolute_import, unicode_literals
 
 from datetime import timedelta
 
+import timezone_field
+from celery import schedules
+from celery.five import python_2_unicode_compatible
 from django.core.exceptions import MultipleObjectsReturned, ValidationError
+from django.core.validators import MaxValueValidator
 from django.db import models
 from django.db.models import signals
 from django.utils.translation import ugettext_lazy as _
 
-from celery import schedules
-from celery.five import python_2_unicode_compatible
-
-from . import managers
+from . import managers, validators
 from .tzcrontab import TzAwareCrontab
-from .utils import now, make_aware
+from .utils import make_aware, now
 
-import timezone_field
 
 DAYS = 'days'
 HOURS = 'hours'
@@ -152,16 +152,25 @@ class CrontabSchedule(models.Model):
     # 4 chars for each value (what we save on 0-9 accomodates the []).
     # We leave the other fields at their historical length.
     #
-    minute = models.CharField(_('minute'), max_length=60 * 4, default='*')
-    hour = models.CharField(_('hour'), max_length=24 * 4, default='*')
+    minute = models.CharField(
+        _('minute'), max_length=60 * 4, default='*',
+        validators=[validators.minute_validator],
+    )
+    hour = models.CharField(
+        _('hour'), max_length=24 * 4, default='*',
+        validators=[validators.hour_validator],
+    )
     day_of_week = models.CharField(
         _('day of week'), max_length=64, default='*',
+        validators=[validators.day_of_week_validator],
     )
     day_of_month = models.CharField(
         _('day of month'), max_length=31 * 4, default='*',
+        validators=[validators.day_of_month_validator],
     )
     month_of_year = models.CharField(
         _('month of year'), max_length=64, default='*',
+        validators=[validators.month_of_year_validator],
     )
 
     timezone = timezone_field.TimeZoneField(default='UTC')
@@ -273,6 +282,10 @@ class PeriodicTask(models.Model):
     routing_key = models.CharField(
         _('routing key'), max_length=200, blank=True, null=True, default=None,
     )
+    priority = models.PositiveIntegerField(
+        _('priority'), default=None, validators=[MaxValueValidator(255)],
+        blank=True, null=True
+    )
     expires = models.DateTimeField(
         _('expires'), blank=True, null=True,
     )
@@ -306,18 +319,24 @@ class PeriodicTask(models.Model):
 
     def validate_unique(self, *args, **kwargs):
         super(PeriodicTask, self).validate_unique(*args, **kwargs)
-        if not self.interval and not self.crontab and not self.solar:
+
+        schedule_types = ['interval', 'crontab', 'solar']
+        selected_schedule_types = [s for s in schedule_types
+                                   if getattr(self, s)]
+
+        if len(selected_schedule_types) == 0:
             raise ValidationError({
                 'interval': [
                     'One of interval, crontab, or solar must be set.'
                 ]
             })
-        if self.interval and self.crontab and self.solar:
-            raise ValidationError({
-                'crontab': [
-                    'Only one of interval, crontab, or solar must be set'
-                ]
-            })
+
+        err_msg = 'Only one of interval, crontab, or solar must be set'
+        if len(selected_schedule_types) > 1:
+            error_info = {}
+            for selected_schedule_type in selected_schedule_types:
+                error_info[selected_schedule_type] = [err_msg]
+            raise ValidationError(error_info)
 
     def save(self, *args, **kwargs):
         self.exchange = self.exchange or None
